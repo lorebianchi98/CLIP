@@ -220,7 +220,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, dense: bool = False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -232,12 +232,15 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
+        dense_out = self.ln_post(x[:, :, :])
         x = self.ln_post(x[:, 0, :])
-
+        
         if self.proj is not None:
             x = x @ self.proj
+            dense_out = dense_out @ self.proj
+        # assert torch.all(x == dense_out[:, 0]).item(), "Incongruent feature dimensions"
 
-        return x
+        return x if not dense else (x, dense_out)
 
 
 class CLIP(nn.Module):
@@ -337,24 +340,25 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, dense=False):
+        return self.visual(image.type(self.dtype), dense)
 
-    def encode_text(self, text):
+    def encode_text(self, text, dense=False):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        word_features = x
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
+        dense_out = x @ self.text_projection
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        # assert torch.all(dense_out[torch.arange(x.shape[0]), text.argmax(dim=-1)] == x).item(), "Incongruent dense feature vector"
 
-        return x, word_features
+        return x if not dense else (x, dense_out)
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
